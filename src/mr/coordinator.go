@@ -52,8 +52,8 @@ type Coordinator struct {
 	Phase          WorkPhase
 	MapTaskList    []*Task
 	ReduceTaskList []*Task
-	nReduce        int        // reduce任务数量
-	mu             sync.Mutex // 一个互斥锁就够了
+	nReduce        int // reduce任务数量
+	mu             sync.Mutex
 	mapDone        bool
 	reduceDone     bool
 }
@@ -162,7 +162,7 @@ func (c *Coordinator) ReportTask(args *ReportArgs, reply *ReportReply) error {
 	return nil
 }
 
-func (c *Coordinator) HealthUpdata(args *HealthArgs, reply *HealthReply) error {
+func (c *Coordinator) HealthUpdate(args *HealthArgs, reply *HealthReply) error {
 	if args.TaskType == Map {
 		c.MapTaskList[args.TaskId].FreshTime = time.Now()
 	} else if args.TaskType == Reduce {

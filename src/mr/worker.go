@@ -44,14 +44,14 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			go func() {
 				defer cancel()
-				HealthUpdata(ctx, task)
+				HealthUpdate(ctx, task)
 			}()
 
 			MapTask(mapf, task, nReduce)
 		} else if task.Type == Reduce {
 			go func() {
 				defer cancel()
-				HealthUpdata(ctx, task)
+				HealthUpdate(ctx, task)
 			}()
 
 			ReduceTask(reducef, task)
@@ -147,7 +147,7 @@ func ReduceTask(reducef func(string, []string) string, task *Task) {
 
 	ReportTask(task)
 }
-func HealthUpdata(ctx context.Context, task *Task) {
+func HealthUpdate(ctx context.Context, task *Task) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -158,7 +158,7 @@ func HealthUpdata(ctx context.Context, task *Task) {
 			args.TaskType = task.Type
 			reply := HealthReply{}
 
-			call("Coordinator.HealthUpdata", &args, &reply)
+			call("Coordinator.HealthUpdate", &args, &reply)
 			time.Sleep(800 * time.Millisecond)
 		}
 	}
