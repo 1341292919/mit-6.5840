@@ -12,6 +12,8 @@ package raft
 // Make() 创建一个新的 Raft 节点，实现 Raft 接口。
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -96,6 +98,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1 // 重置投票状态
 		rf.state = Follower
+		rf.persist()
 	}
 	// 候选人的日志必须至少和自己一样新（通过比较最后一条日志）
 	lastLogIndex := len(rf.log) - 1
@@ -107,6 +110,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if IsCandidateNew && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -153,6 +157,7 @@ func (rf *Raft) convertToCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.lastHeartBeat = time.Now()
+	rf.persist()
 	rf.startElection()
 }
 
@@ -185,6 +190,7 @@ func (rf *Raft) handleVoteReply(reply RequestVoteReply) {
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 		return
 	}
 	if rf.state == Candidate && reply.VoteGranted {
@@ -225,8 +231,10 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -242,7 +250,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newlog := &LogEntry{Term: term, Command: command, Index: index}
 	//log.Printf("%v leader: %v", newlog, rf.me)
 	rf.log = append(rf.log, *newlog)
-	// 接下来异步 通知follower 复制并检查复制情况
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -297,13 +305,28 @@ func (rf *Raft) CloneToAll() {
 				rf.currentTerm = reply.Term
 				rf.state = Follower
 				rf.votedFor = -1
+				rf.persist()
 				rf.mu.Unlock()
 				return
 			}
 			rf.mu.Lock()
 			// 到这里就是 reply失败 next应该回退直到找到能够匹配的位置
 			if rf.nextIndex[peer] > 1 && IsAppend { // 到这里 follower崩了不应该再回溯了
-				rf.nextIndex[peer] = rf.nextIndex[peer] - 1
+				if reply.ConflictTerm == -1 {
+					rf.nextIndex[peer] = reply.ConflictIndex
+				} else {
+					lastIndex := -1
+					for i := range rf.log {
+						if rf.log[i].Term == reply.ConflictTerm {
+							lastIndex = i
+						}
+					}
+					if lastIndex != -1 {
+						rf.nextIndex[peer] = lastIndex + 1
+					} else {
+						rf.nextIndex[peer] = reply.ConflictIndex
+					}
+				}
 			}
 			rf.mu.Unlock()
 		}(peer)
@@ -328,7 +351,7 @@ func (rf *Raft) CloneToAll() {
 		issame := rf.log[N].Term == rf.currentTerm
 		if num > len(rf.peers)/2 && issame {
 			rf.commitIndex = N
-
+			rf.persist()
 			go rf.applyMsg()
 			break
 		}
@@ -353,6 +376,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
+		rf.persist()
 	}
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -376,6 +400,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			for rf.log[rf.commitIndex].Term != rf.currentTerm && rf.commitIndex > lastIndex { //只提交当前任期的
 				rf.commitIndex--
 			}
+			rf.persist()
 			go rf.applyMsg()
 		}
 		return
@@ -383,15 +408,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(rf.log)-1 < args.PrevLogIndex {
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			reply.ConflictIndex = len(rf.log)
+			reply.ConflictTerm = -1
 			return
 		}
 		if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			reply.ConflictIndex = args.PrevLogIndex
+			for i := args.PrevLogIndex; i > 0; i-- {
+				if rf.log[i].Term != reply.ConflictTerm {
+					reply.ConflictIndex = i + 1
+					break
+				}
+			}
 			return
 		}
 		rf.log = rf.log[0 : args.PrevLogIndex+1] // 本地日志在此之后的都舍弃了
 		rf.log = append(rf.log, args.Entries...) // 更新传过来的
+		rf.persist()
 		reply.Success = true
 		reply.Term = rf.currentTerm
 
@@ -436,14 +472,14 @@ func (rf *Raft) applyMsg() {
 // 实现快照后，传递当前快照（如果没有快照则为 nil）。
 
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.commitIndex)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -452,19 +488,22 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var (
+		logs        []LogEntry
+		currentTerm int
+		votedFor    int
+		commitIndex int
+	)
+	if d.Decode(&logs) != nil || d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&commitIndex) != nil {
+		DPrintf("error")
+	} else {
+		rf.log = logs
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+		rf.commitIndex = commitIndex
+	}
 }
 
 // how many bytes in Raft's persisted log?
